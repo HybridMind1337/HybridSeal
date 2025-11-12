@@ -1,0 +1,159 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+require __DIR__ . '/../vendor/autoload.php';
+
+use HybridMind\HybridSeal\KeyStore;
+use HybridMind\HybridSeal\TokenManager;
+use HybridMind\HybridSeal\Exceptions\HybridSealException;
+
+function usage(int $code = 1): void {
+    $u = <<<TXT
+HybridSeal CLI
+
+Usage:
+  hybridseal key:gen [--bytes=32]
+  hybridseal sign --secret-hex=HEX --kid=KID --ttl=2h [--aud=STR] [--sub=STR] [--nbf=10s] [--data='{"k":"v"}']
+  hybridseal verify --secret-hex=HEX --kid=KID [--aud=STR] [--sub=STR] <token>
+
+Env:
+  HYBRIDSEAL_SECRET_HEX   hex master secret (fallback to --secret-hex)
+  HYBRIDSEAL_KID          key id (fallback to --kid)
+
+Examples:
+  hybridseal key:gen --bytes=32
+  hybridseal sign --ttl=15m --aud=auth:web --sub=user_1 --data='{"role":"user"}'
+  hybridseal verify --aud=auth:web <token>
+
+TXT;
+    fwrite($code === 0 ? STDOUT : STDERR, $u);
+    exit($code);
+}
+
+$args = $argv;
+array_shift($args);
+$cmd = $args[0] ?? null;
+if ($cmd === null) usage();
+
+function parseOpts(array $args): array {
+    $opts = [];
+    foreach ($args as $a) {
+        if ($a === '--help' || $a === '-h') $opts['help'] = true;
+        elseif (str_starts_with($a, '--') && str_contains($a, '=')) {
+            [$k, $v] = explode('=', substr($a, 2), 2);
+            $opts[$k] = $v;
+        } elseif (str_starts_with($a, '--')) {
+            $opts[substr($a, 2)] = true;
+        } else {
+            $opts['_'][] = $a;
+        }
+    }
+    return $opts;
+}
+
+$opts = parseOpts(array_slice($args, 1));
+
+switch ($cmd) {
+    case 'key:gen': {
+        if (!empty($opts['help'])) usage(0);
+        $bytes = isset($opts['bytes']) && ctype_digit((string)$opts['bytes']) ? (int)$opts['bytes'] : 32;
+        if ($bytes < 16) {
+            fwrite(STDERR, "bytes must be >= 16\n");
+            exit(1);
+        }
+        $hex = bin2hex(random_bytes($bytes));
+        echo $hex . PHP_EOL;
+        exit(0);
+    }
+
+    case 'sign': {
+        if (!empty($opts['help'])) usage(0);
+
+        $secretHex = $opts['secret-hex'] ?? getenv('HYBRIDSEAL_SECRET_HEX') ?: null;
+        $kid       = $opts['kid']        ?? getenv('HYBRIDSEAL_KID')        ?: null;
+        $ttl       = $opts['ttl']        ?? null;
+
+        if (!$secretHex || !$kid || !$ttl) {
+            fwrite(STDERR, "Missing --secret-hex, --kid, or --ttl (env fallbacks: HYBRIDSEAL_SECRET_HEX, HYBRIDSEAL_KID).\n");
+            exit(1);
+        }
+
+        $hexByKid = [$kid => $secretHex];
+        $keystore = KeyStore::fromHex($hexByKid, $kid);
+        $seal     = new TokenManager($keystore);
+
+        $aud  = $opts['aud']  ?? null;
+        $sub  = $opts['sub']  ?? null;
+        $nbf  = $opts['nbf']  ?? null;
+
+        $data = null;
+        if (isset($opts['data'])) {
+            $json = $opts['data'];
+            try {
+                $parsed = json_decode($json, true, flags: JSON_THROW_ON_ERROR);
+                if (!is_array($parsed)) {
+                    throw new \JsonException('data must be a JSON object');
+                }
+                $data = $parsed;
+            } catch (\JsonException $e) {
+                fwrite(STDERR, "Invalid --data JSON: {$e->getMessage()}\n");
+                exit(1);
+            }
+        }
+
+        try {
+            $token = $seal->sign(
+                    data: $data,
+                    expiresIn: $ttl,
+                    aud: $aud,
+                    sub: $sub,
+                    notBefore: $nbf
+            );
+            echo $token . PHP_EOL;
+            exit(0);
+        } catch (HybridSealException $e) {
+            fwrite(STDERR, "Sign error: {$e->getMessage()}\n");
+            exit(1);
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "Unexpected error: {$e->getMessage()}\n");
+            exit(1);
+        }
+    }
+
+    case 'verify': {
+        if (!empty($opts['help'])) usage(0);
+
+        $secretHex = $opts['secret-hex'] ?? getenv('HYBRIDSEAL_SECRET_HEX') ?: null;
+        $kid       = $opts['kid']        ?? getenv('HYBRIDSEAL_KID')        ?: null;
+        $token     = $opts['_'][0] ?? null;
+
+        if (!$secretHex || !$kid || !$token) {
+            fwrite(STDERR, "Missing --secret-hex, --kid, or <token>.\n");
+            exit(1);
+        }
+
+        $aud  = $opts['aud'] ?? null;
+        $sub  = $opts['sub'] ?? null;
+
+        $hexByKid = [$kid => $secretHex];
+        $keystore = KeyStore::fromHex($hexByKid, $kid);
+        $seal     = new TokenManager($keystore);
+
+        try {
+            $payload = $seal->verify($token, $aud, $sub);
+            $out = json_encode($payload->toArray(), JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+            echo $out . PHP_EOL;
+            exit(0);
+        } catch (HybridSealException $e) {
+            fwrite(STDERR, "Verify failed: {$e->getMessage()}\n");
+            exit(1);
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "Unexpected error: {$e->getMessage()}\n");
+            exit(1);
+        }
+    }
+
+    default:
+        usage();
+}
